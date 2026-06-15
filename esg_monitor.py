@@ -33,7 +33,7 @@ EMAIL_RECEIVER = os.environ["EMAIL_RECEIVER"]
 EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 
 # ─── 1. RSS 수집 ───────────────────────────────────────────────────────────────
