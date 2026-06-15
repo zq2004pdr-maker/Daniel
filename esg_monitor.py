@@ -9,6 +9,7 @@ import json
 import smtplib
 import hashlib
 import logging
+import difflib
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -38,6 +39,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def fetch_articles(urls: list[str], cutoff: datetime = CUTOFF) -> list[dict]:
     seen_hashes: set[str] = set()
+    seen_titles: list[str] = []
     articles: list[dict] = []
 
     for url in urls:
@@ -55,10 +57,18 @@ def fetch_articles(urls: list[str], cutoff: datetime = CUTOFF) -> list[dict]:
                 if pub_dt is None or pub_dt < cutoff:
                     continue
 
+                # 정확한 중복 제거
                 dedup_key = hashlib.md5(title.encode()).hexdigest()
                 if dedup_key in seen_hashes:
                     continue
+
+                # 유사 제목 중복 제거 (72% 이상 유사하면 같은 이슈로 판단)
+                if _is_similar_title(title, seen_titles):
+                    log.debug("유사 기사 제외: %s", title[:50])
+                    continue
+
                 seen_hashes.add(dedup_key)
+                seen_titles.append(title)
 
                 articles.append({
                     "title": title,
@@ -73,6 +83,14 @@ def fetch_articles(urls: list[str], cutoff: datetime = CUTOFF) -> list[dict]:
     log.info("수집된 기사 수: %d (기준: 최근 %dh)", len(articles),
              round((NOW_KST - cutoff).total_seconds() / 3600))
     return articles
+
+
+def _is_similar_title(title: str, seen: list[str], threshold: float = 0.72) -> bool:
+    t = title.lower()
+    for s in seen:
+        if difflib.SequenceMatcher(None, t, s.lower()).ratio() >= threshold:
+            return True
+    return False
 
 
 def _parse_date(raw: str) -> datetime | None:
@@ -161,79 +179,130 @@ def analyze_all(articles: list[dict]) -> list[dict]:
 # ─── 3. HTML 이메일 생성 ───────────────────────────────────────────────────────
 
 SCORE_COLORS = {
-    "high": "#DC2626",    # 9-10: 빨강
-    "mid": "#EA580C",     # 7-8: 주황
+    "high":   "#DC2626",  # 9-10: 빨강
+    "mid":    "#EA580C",  # 7-8: 주황
     "normal": "#2563EB",  # 6: 파랑
-    "low": "#6B7280",     # ~5: 회색
+    "low":    "#6B7280",  # ~5: 회색
+}
+SCORE_LABELS = {
+    "high":   "긴급",
+    "mid":    "중요",
+    "normal": "일반",
+    "low":    "참고",
 }
 
 
-def _score_color(score: int) -> str:
-    if score >= 9:
-        return SCORE_COLORS["high"]
-    if score >= 7:
-        return SCORE_COLORS["mid"]
-    if score >= 6:
-        return SCORE_COLORS["normal"]
-    return SCORE_COLORS["low"]
+def _score_tier(score: int) -> str:
+    if score >= 9: return "high"
+    if score >= 7: return "mid"
+    if score >= 6: return "normal"
+    return "low"
+
+
+def _bullet_rows(items: list[str], color: str) -> str:
+    rows = []
+    for text in items:
+        if not text:
+            continue
+        rows.append(
+            f'<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:6px;">'
+            f'<span style="color:{color};font-size:9px;margin-top:5px;flex-shrink:0;">&#9632;</span>'
+            f'<span style="color:#374151;font-size:13px;line-height:1.6;">{text}</span>'
+            f'</div>'
+        )
+    return "".join(rows)
 
 
 def build_html(articles: list[dict]) -> str:
     date_str = NOW_KST.strftime("%Y년 %m월 %d일")
-    cards_html = ""
 
+    # 헤더 통계
+    urgent  = sum(1 for a in articles if a.get("score", 0) >= 9)
+    important = sum(1 for a in articles if 7 <= a.get("score", 0) < 9)
+    normal  = sum(1 for a in articles if a.get("score", 0) < 7)
+
+    stat_html = (
+        f'<span style="margin-right:18px;font-size:13px;opacity:0.9;">'
+        f'<span style="font-weight:700;font-size:18px;">{urgent}</span> 긴급</span>'
+        f'<span style="margin-right:18px;font-size:13px;opacity:0.9;">'
+        f'<span style="font-weight:700;font-size:18px;">{important}</span> 중요</span>'
+        f'<span style="font-size:13px;opacity:0.9;">'
+        f'<span style="font-weight:700;font-size:18px;">{normal}</span> 일반</span>'
+    )
+
+    # 기사 카드
+    cards_html = ""
     for art in articles:
         score = art.get("score", 0)
-        color = _score_color(score)
-        category = art.get("category", "기타")
-        core = art.get("core_summary", ["", ""])
-        implication = art.get("samsung_implication", ["", ""])
-        action = art.get("action_plan", "")
+        tier  = _score_tier(score)
+        color = SCORE_COLORS[tier]
+        label = SCORE_LABELS[tier]
+        category   = art.get("category", "기타")
+        core       = art.get("core_summary", [])
+        implication = art.get("samsung_implication", [])
+        action     = art.get("action_plan", "")
         article_url = art["link"]
-        pub_str = art["published"].strftime("%m/%d %H:%M") if art.get("published") else ""
+        pub_str    = art["published"].strftime("%m/%d %H:%M") if art.get("published") else ""
 
-        core_html = "".join(f"<li>{s}</li>" for s in core if s)
-        impl_html = "".join(f"<li>{s}</li>" for s in implication if s)
+        core_html = _bullet_rows(core, color)
+        impl_html = _bullet_rows(implication, color)
 
         cards_html += f"""
-        <div style="background:#fff;border-radius:12px;padding:20px 24px;margin-bottom:20px;
-                    box-shadow:0 1px 4px rgba(0,0,0,0.08);border-left:5px solid {color};">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
-            <span style="background:{color};color:#fff;font-weight:700;font-size:18px;
-                         padding:4px 12px;border-radius:20px;">{score}</span>
-            <span style="background:#F3F4F6;color:#374151;font-size:12px;
-                         padding:3px 10px;border-radius:10px;">{category}</span>
-            <span style="color:#9CA3AF;font-size:12px;margin-left:auto;">{pub_str} KST</span>
-          </div>
-          <h3 style="margin:0 0 12px;font-size:16px;line-height:1.5;">
-            <a href="{article_url}" style="color:#111827;text-decoration:none;"
-               target="_blank">{art['title']}</a>
-          </h3>
-          <div style="margin-bottom:10px;">
-            <p style="font-weight:600;color:#374151;margin:0 0 4px;font-size:13px;">핵심 요약</p>
-            <ul style="margin:0;padding-left:18px;color:#4B5563;font-size:13px;line-height:1.7;">
-              {core_html}
-            </ul>
-          </div>
-          <div style="margin-bottom:10px;">
-            <p style="font-weight:600;color:#374151;margin:0 0 4px;font-size:13px;">삼성전자 시사점</p>
-            <ul style="margin:0;padding-left:18px;color:#4B5563;font-size:13px;line-height:1.7;">
-              {impl_html}
-            </ul>
-          </div>
-          <div style="background:#F9FAFB;border-radius:8px;padding:10px 14px;">
-            <p style="font-weight:600;color:#374151;margin:0 0 3px;font-size:12px;">액션플랜</p>
-            <p style="color:#1D4ED8;margin:0;font-size:13px;font-weight:500;">{action}</p>
-          </div>
-        </div>"""
+    <div style="background:#ffffff;border-radius:16px;overflow:hidden;
+                margin-bottom:16px;box-shadow:0 2px 12px rgba(0,0,0,0.07);">
+      <!-- 점수 색상 상단 바 -->
+      <div style="height:5px;background:{color};"></div>
 
-    legend_html = "".join([
-        f'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:14px;">'
-        f'<span style="width:12px;height:12px;border-radius:50%;background:{c};display:inline-block;"></span>'
-        f'<span style="font-size:12px;color:#6B7280;">{label}</span></span>'
-        for label, c in [("9-10점", SCORE_COLORS["high"]), ("7-8점", SCORE_COLORS["mid"]),
-                          ("6점", SCORE_COLORS["normal"]), ("~5점", SCORE_COLORS["low"])]
-    ])
+      <div style="padding:20px 24px;">
+        <!-- 상단 메타 -->
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
+          <!-- 점수 원형 뱃지 -->
+          <div style="width:46px;height:46px;border-radius:50%;background:{color};
+                      display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            <span style="color:#fff;font-size:20px;font-weight:900;line-height:1;">{score}</span>
+          </div>
+          <div>
+            <div style="margin-bottom:4px;">
+              <span style="background:{color}1a;color:{color};font-size:11px;font-weight:700;
+                           padding:3px 10px;border-radius:20px;margin-right:6px;">{label}</span>
+              <span style="background:#F3F4F6;color:#6B7280;font-size:11px;
+                           padding:3px 10px;border-radius:20px;">{category}</span>
+            </div>
+            <span style="color:#9CA3AF;font-size:11px;">{pub_str} KST</span>
+          </div>
+        </div>
+
+        <!-- 제목 -->
+        <h3 style="margin:0 0 16px;font-size:16px;font-weight:700;line-height:1.55;color:#111827;">
+          <a href="{article_url}" style="color:#111827;text-decoration:none;" target="_blank">{art['title']}</a>
+        </h3>
+
+        <!-- 구분선 -->
+        <div style="border-top:1px solid #F3F4F6;margin-bottom:14px;"></div>
+
+        <!-- 핵심 요약 -->
+        <div style="margin-bottom:12px;">
+          <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;
+                      color:#9CA3AF;margin-bottom:8px;">핵심 요약</div>
+          {core_html}
+        </div>
+
+        <!-- 삼성전자 시사점 -->
+        <div style="margin-bottom:14px;">
+          <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;
+                      color:#9CA3AF;margin-bottom:8px;">삼성전자 시사점</div>
+          {impl_html}
+        </div>
+
+        <!-- 액션플랜 -->
+        <div style="background:linear-gradient(135deg,#EFF6FF,#DBEAFE);border-radius:10px;
+                    padding:13px 16px;border-left:3px solid #3B82F6;">
+          <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;
+                      color:#3B82F6;margin-bottom:5px;">액션플랜</div>
+          <div style="color:#1E40AF;font-size:13px;font-weight:600;line-height:1.6;">{action}</div>
+        </div>
+      </div>
+    </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
@@ -241,33 +310,47 @@ def build_html(articles: list[dict]) -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 </head>
-<body style="margin:0;padding:0;background:#F3F4F6;font-family:'Apple SD Gothic Neo',
-             'Noto Sans KR',Arial,sans-serif;">
-  <div style="max-width:680px;margin:0 auto;padding:20px;">
+<body style="margin:0;padding:0;background:#F0F2F5;font-family:'Apple SD Gothic Neo','Noto Sans KR',Arial,sans-serif;">
+  <div style="max-width:680px;margin:0 auto;padding:24px 16px;">
 
     <!-- 헤더 -->
-    <div style="background:linear-gradient(135deg,#1a7f37 0%,#166534 100%);
-                border-radius:14px;padding:28px 30px;margin-bottom:20px;color:#fff;">
-      <div style="font-size:12px;opacity:0.8;margin-bottom:4px;">삼성전자 ESG 전략팀</div>
-      <h1 style="margin:0 0 6px;font-size:24px;font-weight:700;">ESG 뉴스 브리핑</h1>
-      <div style="font-size:14px;opacity:0.9;">{date_str} &nbsp;·&nbsp; 총 {len(articles)}건</div>
+    <div style="background:linear-gradient(135deg,#0d5c2e 0%,#1a7f37 60%,#15803d 100%);
+                border-radius:18px;padding:30px 32px;margin-bottom:16px;color:#fff;">
+      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:2px;
+                  opacity:0.65;margin-bottom:10px;">삼성전자 ESG 전략팀</div>
+      <h1 style="margin:0 0 6px;font-size:26px;font-weight:800;letter-spacing:-0.5px;">ESG 뉴스 브리핑</h1>
+      <div style="font-size:14px;opacity:0.8;margin-bottom:20px;">{date_str} &nbsp;·&nbsp; 총 {len(articles)}건</div>
+      <!-- 통계 요약 -->
+      <div style="background:rgba(255,255,255,0.12);border-radius:12px;padding:14px 18px;
+                  display:flex;align-items:center;">
+        {stat_html}
+      </div>
     </div>
 
-    <!-- 범례 -->
-    <div style="background:#fff;border-radius:10px;padding:12px 18px;margin-bottom:20px;
-                box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-      <span style="font-size:12px;color:#6B7280;margin-right:10px;">점수 범례:</span>
-      {legend_html}
+    <!-- 점수 범례 -->
+    <div style="background:#fff;border-radius:12px;padding:12px 20px;margin-bottom:20px;
+                box-shadow:0 1px 4px rgba(0,0,0,0.06);display:flex;align-items:center;flex-wrap:wrap;gap:4px;">
+      <span style="font-size:11px;color:#9CA3AF;font-weight:600;margin-right:8px;">점수 기준</span>
+      {''.join(
+          f'<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;">'
+          f'<span style="width:10px;height:10px;border-radius:50%;background:{SCORE_COLORS[t]};display:inline-block;"></span>'
+          f'<span style="font-size:12px;color:#6B7280;">{lbl} ({rng})</span></span>'
+          for t, lbl, rng in [
+              ("high","긴급","9-10"), ("mid","중요","7-8"),
+              ("normal","일반","6"), ("low","참고","~5"),
+          ]
+      )}
     </div>
 
     <!-- 기사 카드 -->
     {cards_html}
 
     <!-- 푸터 -->
-    <div style="text-align:center;padding:20px 0;color:#9CA3AF;font-size:12px;">
-      자동 생성 · ESG Monitor &nbsp;|&nbsp; Powered by Gemini AI<br>
+    <div style="text-align:center;padding:24px 0 8px;color:#9CA3AF;font-size:11px;line-height:1.8;">
+      자동 생성 &nbsp;·&nbsp; ESG Monitor &nbsp;·&nbsp; Powered by Gemini AI<br>
       기사 제목 클릭 시 원문으로 이동합니다.
     </div>
+
   </div>
 </body>
 </html>"""
