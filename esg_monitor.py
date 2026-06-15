@@ -15,7 +15,7 @@ from email.mime.text import MIMEText
 from urllib.parse import quote
 
 import feedparser
-import google.generativeai as genai
+from google import genai
 from dateutil import parser as dateutil_parser
 
 from config import ALL_RSS_URLS, MIN_ARTICLES, PRIORITY_SCORE
@@ -32,8 +32,7 @@ EMAIL_SENDER = os.environ["EMAIL_SENDER"]
 EMAIL_RECEIVER = os.environ["EMAIL_RECEIVER"]
 EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ─── 1. RSS 수집 ───────────────────────────────────────────────────────────────
@@ -122,7 +121,10 @@ def analyze_article(article: dict) -> dict | None:
         summary=article["summary"][:800] if article["summary"] else "요약 없음",
     )
     try:
-        response = model.generate_content(prompt)
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
         text = response.text.strip()
         text = re.sub(r"```(?:json)?", "", text).strip().rstrip("```").strip()
         result = json.loads(text)
