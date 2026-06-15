@@ -12,7 +12,6 @@ import logging
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from urllib.parse import quote
 
 import feedparser
 from google import genai
@@ -37,7 +36,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ─── 1. RSS 수집 ───────────────────────────────────────────────────────────────
 
-def fetch_articles(urls: list[str]) -> list[dict]:
+def fetch_articles(urls: list[str], cutoff: datetime = CUTOFF) -> list[dict]:
     seen_hashes: set[str] = set()
     articles: list[dict] = []
 
@@ -53,7 +52,7 @@ def fetch_articles(urls: list[str]) -> list[dict]:
                     continue
 
                 pub_dt = _parse_date(published)
-                if pub_dt is None or pub_dt < CUTOFF:
+                if pub_dt is None or pub_dt < cutoff:
                     continue
 
                 dedup_key = hashlib.md5(title.encode()).hexdigest()
@@ -71,7 +70,8 @@ def fetch_articles(urls: list[str]) -> list[dict]:
         except Exception as e:
             log.warning("RSS 파싱 실패 (%s): %s", url, e)
 
-    log.info("수집된 기사 수: %d", len(articles))
+    log.info("수집된 기사 수: %d (기준: 최근 %dh)", len(articles),
+             round((NOW_KST - cutoff).total_seconds() / 3600))
     return articles
 
 
@@ -178,10 +178,6 @@ def _score_color(score: int) -> str:
     return SCORE_COLORS["low"]
 
 
-def _google_search_url(title: str) -> str:
-    return f"https://www.google.com/search?q={quote(title)}"
-
-
 def build_html(articles: list[dict]) -> str:
     date_str = NOW_KST.strftime("%Y년 %m월 %d일")
     cards_html = ""
@@ -193,7 +189,7 @@ def build_html(articles: list[dict]) -> str:
         core = art.get("core_summary", ["", ""])
         implication = art.get("samsung_implication", ["", ""])
         action = art.get("action_plan", "")
-        search_url = _google_search_url(art["title"])
+        article_url = art["link"]
         pub_str = art["published"].strftime("%m/%d %H:%M") if art.get("published") else ""
 
         core_html = "".join(f"<li>{s}</li>" for s in core if s)
@@ -210,7 +206,7 @@ def build_html(articles: list[dict]) -> str:
             <span style="color:#9CA3AF;font-size:12px;margin-left:auto;">{pub_str} KST</span>
           </div>
           <h3 style="margin:0 0 12px;font-size:16px;line-height:1.5;">
-            <a href="{search_url}" style="color:#111827;text-decoration:none;"
+            <a href="{article_url}" style="color:#111827;text-decoration:none;"
                target="_blank">{art['title']}</a>
           </h3>
           <div style="margin-bottom:10px;">
@@ -270,7 +266,7 @@ def build_html(articles: list[dict]) -> str:
     <!-- 푸터 -->
     <div style="text-align:center;padding:20px 0;color:#9CA3AF;font-size:12px;">
       자동 생성 · ESG Monitor &nbsp;|&nbsp; Powered by Gemini AI<br>
-      기사 제목 클릭 시 Google 검색으로 이동합니다.
+      기사 제목 클릭 시 원문으로 이동합니다.
     </div>
   </div>
 </body>
@@ -300,6 +296,12 @@ def main() -> None:
     log.info("=== ESG 모니터링 시작 (%s) ===", NOW_KST.strftime("%Y-%m-%d %H:%M KST"))
 
     articles = fetch_articles(ALL_RSS_URLS)
+    for extra_hours in (48, 72):
+        if len(articles) >= MIN_ARTICLES:
+            break
+        log.info("기사 부족(%d개) → %dh 범위로 재수집", len(articles), extra_hours)
+        articles = fetch_articles(ALL_RSS_URLS, NOW_KST - timedelta(hours=extra_hours))
+
     if not articles:
         log.warning("수집된 기사가 없습니다. RSS URL을 확인하세요.")
         return
